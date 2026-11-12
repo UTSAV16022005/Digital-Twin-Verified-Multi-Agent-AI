@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Raw and generated data stay outside version control.
+data/raw/
+data/processed/
+data/interim/
+models/
+reports/generated/
+
+# Local tooling and notebook outputs.
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+

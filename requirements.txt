@@ -1,0 +1,5 @@
+# Core runtime
+numpy>=1.24,<3.0      # NumPy 2.x is used by the tested Python 3.14 environment
+pandas>=2.0
+scikit-learn>=1.3     # StandardScaler (code falls back to an equivalent NumPy scaler if absent)
+# PyTorch is optional: the LSTM monitoring agent has a deterministic NumPy backend.
