@@ -14,12 +14,276 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+try:
+    import torch as _torch
+    from torch import nn as _torch_nn
+except Exception:  # optional models must not make the base package unimportable
+    _torch = None
+    _torch_nn = None
+
 from src.cmapss_data import (
     fit_feature_scaler,
     make_windows,
+    split_engine_units,
     summarize_windows,
     transform_features,
 )
+
+
+if _torch_nn is not None:
+
+    class _CNNSequenceRegressor(_torch_nn.Module):
+        """Compact temporal CNN with masked-free global mean/max pooling."""
+
+        def __init__(self, in_features: int, hidden_size: int) -> None:
+            super().__init__()
+            channels = max(16, hidden_size)
+            self.convolutions = _torch_nn.Sequential(
+                _torch_nn.Conv1d(in_features, channels, kernel_size=5, padding=2),
+                _torch_nn.GELU(),
+                _torch_nn.Conv1d(channels, channels * 2, kernel_size=3, padding=1),
+                _torch_nn.GELU(),
+            )
+            self.head = _torch_nn.Sequential(
+                _torch_nn.Linear(channels * 4, channels * 2),
+                _torch_nn.GELU(),
+                _torch_nn.Dropout(0.1),
+                _torch_nn.Linear(channels * 2, 1),
+            )
+
+        def forward(self, values):
+            encoded = self.convolutions(values.transpose(1, 2))
+            pooled = _torch.cat(
+                [encoded.mean(dim=-1), encoded.amax(dim=-1)], dim=1
+            )
+            return self.head(pooled).squeeze(-1)
+
+
+    class _TransformerSequenceRegressor(_torch_nn.Module):
+        """Small encoder-only Transformer for fixed-length sensor windows."""
+
+        def __init__(
+            self,
+            in_features: int,
+            window_size: int,
+            hidden_size: int,
+            attention_heads: int,
+            layers: int,
+        ) -> None:
+            super().__init__()
+            if hidden_size % attention_heads:
+                raise ValueError("transformer hidden size must be divisible by attention_heads")
+            self.input_projection = _torch_nn.Linear(in_features, hidden_size)
+            self.position = _torch_nn.Parameter(
+                _torch.zeros(1, window_size, hidden_size)
+            )
+            _torch_nn.init.normal_(self.position, mean=0.0, std=0.02)
+            encoder_layer = _torch_nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=attention_heads,
+                dim_feedforward=hidden_size * 2,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = _torch_nn.TransformerEncoder(
+                encoder_layer, num_layers=layers, enable_nested_tensor=False
+            )
+            self.head = _torch_nn.Sequential(
+                _torch_nn.LayerNorm(hidden_size * 2),
+                _torch_nn.Linear(hidden_size * 2, hidden_size),
+                _torch_nn.GELU(),
+                _torch_nn.Dropout(0.1),
+                _torch_nn.Linear(hidden_size, 1),
+            )
+
+        def forward(self, values):
+            encoded = self.input_projection(values)
+            encoded = encoded + self.position[:, : encoded.shape[1], :]
+            encoded = self.encoder(encoded)
+            pooled = _torch.cat([encoded.mean(dim=1), encoded[:, -1]], dim=1)
+            return self.head(pooled).squeeze(-1)
+
+else:  # pragma: no cover - exercised on optional-dependency-free machines
+    _CNNSequenceRegressor = None
+    _TransformerSequenceRegressor = None
+
+
+class TorchSequenceRULModel:
+    """Trainable CNN or Transformer RUL regressor with inner-fold early stopping."""
+
+    def __init__(
+        self,
+        architecture: str,
+        in_features: int,
+        window_size: int,
+        *,
+        hidden_size: int = 32,
+        attention_heads: int = 4,
+        transformer_layers: int = 2,
+        random_state: int = 42,
+    ) -> None:
+        if _torch is None or _torch_nn is None:
+            raise RuntimeError(
+                "PyTorch CNN/Transformer models require PyTorch; install the CPU "
+                "wheel using the official PyTorch instructions."
+            )
+        if architecture not in {"pytorch_cnn", "pytorch_transformer"}:
+            raise ValueError("architecture must be 'pytorch_cnn' or 'pytorch_transformer'")
+        if in_features < 1 or window_size < 2 or hidden_size < 1:
+            raise ValueError("feature count, window size, and hidden size must be positive")
+        _torch.manual_seed(int(random_state))
+        if architecture == "pytorch_cnn":
+            network = _CNNSequenceRegressor(in_features, hidden_size)
+        else:
+            network = _TransformerSequenceRegressor(
+                in_features,
+                window_size,
+                hidden_size,
+                attention_heads,
+                transformer_layers,
+            )
+        self.architecture = architecture
+        self.model = network.to("cpu")
+        self.random_state = int(random_state)
+        self.target_mean_ = 0.0
+        self.target_scale_ = 1.0
+        self.epochs_trained_: int | None = None
+        self.best_epoch_: int | None = None
+        self.best_validation_loss_: float | None = None
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        X_val: np.ndarray | None = None,
+        y_val: np.ndarray | None = None,
+        *,
+        max_epochs: int = 12,
+        batch_size: int = 128,
+        lr: float = 1e-3,
+        patience: int = 3,
+    ) -> "TorchSequenceRULModel":
+        train_x = np.asarray(X, dtype=np.float32)
+        train_y = np.asarray(y, dtype=np.float32).reshape(-1)
+        if train_x.ndim != 3 or len(train_x) != len(train_y) or not len(train_y):
+            raise ValueError("X must be non-empty (samples, time, features) aligned with y")
+        if not np.isfinite(train_x).all() or not np.isfinite(train_y).all():
+            raise ValueError("training sequences and targets must be finite")
+        if max_epochs < 1 or batch_size < 1 or lr <= 0 or patience < 1:
+            raise ValueError("training epochs, batch size, rate, and patience must be positive")
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be supplied or both omitted")
+
+        val_x: np.ndarray | None = None
+        val_y: np.ndarray | None = None
+        if X_val is not None and y_val is not None:
+            val_x = np.asarray(X_val, dtype=np.float32)
+            val_y = np.asarray(y_val, dtype=np.float32).reshape(-1)
+            if (
+                val_x.ndim != 3
+                or len(val_x) != len(val_y)
+                or not len(val_y)
+                or val_x.shape[1:] != train_x.shape[1:]
+            ):
+                raise ValueError("validation sequences must align with training sequence shape")
+            if not np.isfinite(val_x).all() or not np.isfinite(val_y).all():
+                raise ValueError("validation sequences and targets must be finite")
+
+        self.target_mean_ = float(train_y.mean())
+        self.target_scale_ = float(train_y.std()) or 1.0
+        scaled_train_y = (train_y - self.target_mean_) / self.target_scale_
+        scaled_val_y = (
+            None
+            if val_y is None
+            else (val_y - self.target_mean_) / self.target_scale_
+        )
+        tensor_x = _torch.as_tensor(train_x, dtype=_torch.float32)
+        tensor_y = _torch.as_tensor(scaled_train_y, dtype=_torch.float32)
+        tensor_val_x = (
+            None
+            if val_x is None
+            else _torch.as_tensor(val_x, dtype=_torch.float32)
+        )
+        tensor_val_y = (
+            None
+            if scaled_val_y is None
+            else _torch.as_tensor(scaled_val_y, dtype=_torch.float32)
+        )
+
+        optimizer = _torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        rng = np.random.default_rng(self.random_state)
+        best_loss = float("inf")
+        best_state: dict[str, Any] | None = None
+        best_epoch = 0
+        epochs_without_improvement = 0
+        for epoch in range(1, max_epochs + 1):
+            self.model.train()
+            permutation = rng.permutation(len(tensor_x))
+            train_losses: list[float] = []
+            for start in range(0, len(permutation), batch_size):
+                indices = permutation[start : start + batch_size]
+                batch_x = tensor_x[indices]
+                batch_y = tensor_y[indices]
+                optimizer.zero_grad(set_to_none=True)
+                predictions = self.model(batch_x)
+                loss = _torch_nn.functional.mse_loss(predictions, batch_y)
+                loss.backward()
+                _torch_nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_losses.append(float(loss.detach().item()))
+
+            if tensor_val_x is not None and tensor_val_y is not None:
+                self.model.eval()
+                with _torch.no_grad():
+                    validation_loss = float(
+                        _torch_nn.functional.mse_loss(
+                            self.model(tensor_val_x), tensor_val_y
+                        ).item()
+                    )
+            else:
+                validation_loss = float(np.mean(train_losses))
+            if validation_loss < best_loss - 1e-7:
+                best_loss = validation_loss
+                best_epoch = epoch
+                best_state = {
+                    name: value.detach().clone()
+                    for name, value in self.model.state_dict().items()
+                }
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= patience:
+                    break
+
+        if best_state is None:
+            raise RuntimeError("sequence model training did not produce a finite checkpoint")
+        self.model.load_state_dict(best_state)
+        self.model.eval()
+        self.epochs_trained_ = epoch
+        self.best_epoch_ = best_epoch
+        self.best_validation_loss_ = best_loss if tensor_val_x is not None else None
+        return self
+
+    def predict(self, X: np.ndarray, batch_size: int = 512) -> np.ndarray:
+        values = np.asarray(X, dtype=np.float32)
+        if values.ndim != 3 or not np.isfinite(values).all():
+            raise ValueError("X must be a finite (samples, time, features) array")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        predictions: list[np.ndarray] = []
+        self.model.eval()
+        with _torch.no_grad():
+            for start in range(0, len(values), batch_size):
+                batch = _torch.as_tensor(
+                    values[start : start + batch_size], dtype=_torch.float32
+                )
+                scaled = self.model(batch).cpu().numpy()
+                predictions.append(scaled * self.target_scale_ + self.target_mean_)
+        if not predictions:
+            return np.empty((0,), dtype=np.float32)
+        return np.maximum(np.concatenate(predictions), 0.0)
 
 
 def nasa_score(targets: np.ndarray, predictions: np.ndarray) -> float:
@@ -87,10 +351,52 @@ class PrognosticsConfig:
     max_features: float = 0.70
     random_state: int = 42
     rul_reference: float = 125.0
-    model_type: str = "random_forest"  # "random_forest", "lstm", "ridge", "naive"
+    model_type: str = "random_forest"
+    training_window_stride: int = 1
+    include_cycle_feature: bool = False
+    planning_margin_cycles: tuple[int, ...] = ()
+    lstm_hidden_size: int = 24
+    lstm_epochs: int = 12
+    lstm_batch_size: int = 128
+    lstm_learning_rate: float = 1e-3
+    lstm_training_stride: int = 5
+    lstm_validation_fraction: float = 0.15
+    lstm_early_stopping_patience: int = 3
+    xgb_n_estimators: int = 250
+    xgb_max_depth: int = 5
+    xgb_learning_rate: float = 0.04
+    xgb_subsample: float = 0.9
+    xgb_colsample_bytree: float = 0.8
+    torch_hidden_size: int = 32
+    torch_epochs: int = 8
+    torch_batch_size: int = 128
+    torch_learning_rate: float = 1e-3
+    torch_training_stride: int = 5
+    torch_validation_fraction: float = 0.15
+    torch_early_stopping_patience: int = 2
+    torch_attention_heads: int = 4
+    torch_transformer_layers: int = 2
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def _append_cycle_channel(
+    windows: np.ndarray,
+    metadata: pd.DataFrame,
+) -> np.ndarray:
+    """Append normalized per-timestep engine age to sequence windows."""
+
+    if len(windows) != len(metadata):
+        raise ValueError("window metadata length does not match the sequence count")
+    offsets = np.arange(windows.shape[1], dtype=np.float32)[None, :]
+    first_cycle = (
+        metadata["end_cycle"].to_numpy(dtype=np.float32)[:, None]
+        - windows.shape[1]
+        + 1
+    )
+    cycle_channel = (first_cycle + offsets)[:, :, None] / 100.0
+    return np.concatenate([windows, cycle_channel], axis=2).astype(np.float32)
 
 
 class NaiveRULModel:
@@ -155,6 +461,7 @@ class NumpyLSTMRULModel:
         max_epochs: int = 15,
         batch_size: int = 128,
         lr: float = 1e-3,
+        patience: int = 3,
     ) -> "NumpyLSTMRULModel":
         X_train = np.asarray(X_train, dtype=np.float32)
         y_train = np.asarray(y_train, dtype=np.float32).reshape(-1)
@@ -164,6 +471,21 @@ class NumpyLSTMRULModel:
             raise ValueError("X_train and y_train must have the same non-zero sample count")
         if not np.isfinite(X_train).all() or not np.isfinite(y_train).all():
             raise ValueError("training sequences and RUL targets must be finite")
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be supplied or both omitted")
+        if X_val is not None:
+            X_val = np.asarray(X_val, dtype=np.float32)
+            y_val = np.asarray(y_val, dtype=np.float32).reshape(-1)
+            if X_val.ndim != 3 or X_val.shape[2] != self.in_features:
+                raise ValueError("X_val must have shape (samples, time, in_features)")
+            if len(X_val) != len(y_val) or len(y_val) == 0:
+                raise ValueError("X_val and y_val must have the same non-zero sample count")
+            if not np.isfinite(X_val).all() or not np.isfinite(y_val).all():
+                raise ValueError("validation sequences and RUL targets must be finite")
+        if max_epochs < 1 or batch_size < 1 or lr <= 0:
+            raise ValueError("max_epochs, batch_size, and lr must be positive")
+        if patience < 1:
+            raise ValueError("patience must be at least one")
         self.target_mean_ = float(y_train.mean())
         target_std = float(y_train.std())
         self.target_scale_ = target_std if target_std > 1e-8 else 1.0
@@ -171,6 +493,11 @@ class NumpyLSTMRULModel:
         rng = np.random.default_rng(self.seed)
         n = len(X_train)
         H = self.hidden_size
+        best_validation_loss = float("inf")
+        best_params: Dict[str, np.ndarray] | None = None
+        best_epoch = 0
+        epochs_without_improvement = 0
+        epochs_trained = 0
         for epoch in range(1, max_epochs + 1):
             idx = rng.permutation(n)
             for s in range(0, n, batch_size):
@@ -238,6 +565,30 @@ class NumpyLSTMRULModel:
                     v_hat = self.v[k] / (1.0 - 0.999 ** self.t_step)
                     self.params[k] -= (lr * m_hat / (np.sqrt(v_hat) + 1e-8)).astype(np.float32)
 
+            epochs_trained = epoch
+            if X_val is not None and y_val is not None:
+                validation_predictions = self.predict(X_val)
+                validation_loss = float(np.mean((validation_predictions - y_val) ** 2))
+                if validation_loss < best_validation_loss - 1e-6:
+                    best_validation_loss = validation_loss
+                    best_params = {
+                        name: value.copy() for name, value in self.params.items()
+                    }
+                    best_epoch = epoch
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= patience:
+                        break
+
+        if best_params is not None:
+            self.params = best_params
+        self.epochs_trained_ = epochs_trained
+        self.best_epoch_ = best_epoch if best_params is not None else epochs_trained
+        self.best_validation_loss_ = (
+            best_validation_loss if best_params is not None else None
+        )
+
         return self
 
     def predict(self, X: np.ndarray, batch_size: int = 512) -> np.ndarray:
@@ -277,6 +628,7 @@ class PrognosticsAgent:
         config: PrognosticsConfig,
         conformal_q90: float = 25.0,
         conformal_q95: float = 35.0,
+        lower_bound_margin_95: float = 35.0,
     ) -> None:
         self.model = model
         self.scaler = scaler
@@ -284,6 +636,7 @@ class PrognosticsAgent:
         self.config = config
         self.conformal_q90 = float(conformal_q90)
         self.conformal_q95 = float(conformal_q95)
+        self.lower_bound_margin_95 = float(lower_bound_margin_95)
 
     @classmethod
     def fit(
@@ -291,31 +644,226 @@ class PrognosticsAgent:
         training_frame: pd.DataFrame,
         feature_columns: list[str],
         config: PrognosticsConfig | None = None,
+        validation_frame: pd.DataFrame | None = None,
     ) -> "PrognosticsAgent":
         config = config or PrognosticsConfig()
         if "rul" not in training_frame.columns:
             raise ValueError("training_frame must contain a row-level 'rul' column")
+        supported_models = {
+            "random_forest",
+            "xgboost",
+            "ridge",
+            "naive",
+            "lstm",
+            "pytorch_cnn",
+            "pytorch_transformer",
+        }
+        if config.model_type not in supported_models:
+            raise ValueError(
+                f"model_type must be one of {sorted(supported_models)}, "
+                f"got {config.model_type!r}"
+            )
+        if config.window_size < 2:
+            raise ValueError("window_size must be at least two")
+
+        sequence_models = {"lstm", "pytorch_cnn", "pytorch_transformer"}
+        if config.model_type in sequence_models:
+            is_lstm = config.model_type == "lstm"
+            validation_fraction = (
+                config.lstm_validation_fraction
+                if is_lstm
+                else config.torch_validation_fraction
+            )
+            training_stride = (
+                config.lstm_training_stride
+                if is_lstm
+                else config.torch_training_stride
+            )
+            if is_lstm:
+                if config.lstm_hidden_size < 1:
+                    raise ValueError("LSTM hidden size must be positive")
+            elif (
+                config.torch_hidden_size < 1
+                or config.torch_epochs < 1
+                or config.torch_batch_size < 1
+                or config.torch_learning_rate <= 0
+            ):
+                raise ValueError("PyTorch sequence model parameters must be positive")
+            if training_stride < 1:
+                raise ValueError("sequence training stride must be positive")
+            if not 0.0 <= validation_fraction < 0.5:
+                raise ValueError("sequence validation fraction must be in [0, 0.5)")
+
+            sequence_train_frame = training_frame
+            sequence_validation_frame: pd.DataFrame | None = None
+            if validation_frame is not None:
+                if "rul" not in validation_frame.columns:
+                    raise ValueError(
+                        "validation_frame must contain row-level 'rul' labels"
+                    )
+                fit_units = set(training_frame["unit_id"].unique())
+                validation_units = set(validation_frame["unit_id"].unique())
+                if not fit_units.isdisjoint(validation_units):
+                    raise ValueError(
+                        "sequence early-stop engines must be disjoint from fit engines"
+                    )
+                sequence_validation_frame = validation_frame
+            elif training_frame["unit_id"].nunique() >= 8 and validation_fraction > 0.0:
+                inner_split = split_engine_units(
+                    training_frame,
+                    validation_fraction=validation_fraction,
+                    seed=config.random_state,
+                )
+                sequence_train_frame = training_frame[
+                    training_frame["unit_id"].isin(inner_split.train_units)
+                ].copy()
+                sequence_validation_frame = training_frame[
+                    training_frame["unit_id"].isin(inner_split.validation_units)
+                ].copy()
+                if not set(inner_split.train_units).isdisjoint(
+                    inner_split.validation_units
+                ):
+                    raise RuntimeError("engine-level sequence early-stop split overlaps")
+
+            scaler = fit_feature_scaler(sequence_train_frame, feature_columns)
+            scaled_train = transform_features(
+                sequence_train_frame, feature_columns, scaler
+            )
+            windows, targets, metadata = make_windows(
+                scaled_train,
+                feature_columns,
+                window_size=config.window_size,
+                target_column="rul",
+                stride=training_stride,
+            )
+            if len(windows) == 0:
+                raise ValueError(
+                    f"No training windows were generated for {config.model_type}"
+                )
+            if config.include_cycle_feature:
+                windows = _append_cycle_channel(windows, metadata)
+
+            validation_windows = None
+            validation_targets = None
+            if sequence_validation_frame is not None:
+                scaled_validation = transform_features(
+                    sequence_validation_frame, feature_columns, scaler
+                )
+                validation_windows, validation_targets, validation_metadata = (
+                    make_windows(
+                        scaled_validation,
+                        feature_columns,
+                        window_size=config.window_size,
+                        target_column="rul",
+                        stride=training_stride,
+                    )
+                )
+                if len(validation_windows) == 0:
+                    raise ValueError(
+                        f"No validation windows were generated for {config.model_type}"
+                    )
+                if config.include_cycle_feature:
+                    validation_windows = _append_cycle_channel(
+                        validation_windows, validation_metadata
+                    )
+
+            if is_lstm:
+                model: Any = NumpyLSTMRULModel(
+                    in_features=windows.shape[2],
+                    hidden_size=config.lstm_hidden_size,
+                    seed=config.random_state,
+                )
+                model.fit(
+                    windows,
+                    targets,
+                    X_val=validation_windows,
+                    y_val=validation_targets,
+                    max_epochs=config.lstm_epochs,
+                    batch_size=config.lstm_batch_size,
+                    lr=config.lstm_learning_rate,
+                    patience=config.lstm_early_stopping_patience,
+                )
+            else:
+                model = TorchSequenceRULModel(
+                    architecture=config.model_type,
+                    in_features=windows.shape[2],
+                    window_size=config.window_size,
+                    hidden_size=config.torch_hidden_size,
+                    attention_heads=config.torch_attention_heads,
+                    transformer_layers=config.torch_transformer_layers,
+                    random_state=config.random_state,
+                )
+                model.fit(
+                    windows,
+                    targets,
+                    X_val=validation_windows,
+                    y_val=validation_targets,
+                    max_epochs=config.torch_epochs,
+                    batch_size=config.torch_batch_size,
+                    lr=config.torch_learning_rate,
+                    patience=config.torch_early_stopping_patience,
+                )
+            return cls(model, scaler, list(feature_columns), config)
 
         scaler = fit_feature_scaler(training_frame, feature_columns)
         scaled = transform_features(training_frame, feature_columns, scaler)
-        windows, targets, _ = make_windows(
+        if config.training_window_stride < 1:
+            raise ValueError("training_window_stride must be positive")
+        windows, targets, metadata = make_windows(
             scaled,
             feature_columns,
             window_size=config.window_size,
             target_column="rul",
+            stride=config.training_window_stride,
         )
         if len(windows) == 0:
             raise ValueError("No training windows were generated")
         summary_features = summarize_windows(windows)
+        if config.include_cycle_feature:
+            cycle_feature = (
+                metadata["end_cycle"].to_numpy(dtype=np.float32)[:, None] / 100.0
+            )
+            summary_features = np.concatenate(
+                [summary_features, cycle_feature], axis=1
+            )
 
-        model = RandomForestRegressor(
-            n_estimators=config.n_estimators,
-            min_samples_leaf=config.min_samples_leaf,
-            max_features=config.max_features,
-            random_state=config.random_state,
-            n_jobs=-1,
-        )
-        model.fit(summary_features, targets)
+        if config.model_type == "random_forest":
+            model: Any = RandomForestRegressor(
+                n_estimators=config.n_estimators,
+                min_samples_leaf=config.min_samples_leaf,
+                max_features=config.max_features,
+                random_state=config.random_state,
+                n_jobs=-1,
+            )
+            model.fit(summary_features, targets)
+        elif config.model_type == "xgboost":
+            try:
+                from xgboost import XGBRegressor
+            except ImportError as exc:
+                raise RuntimeError(
+                    "XGBoost is optional; install it with "
+                    "python -m pip install -r requirements-model-comparison.txt"
+                ) from exc
+            model = XGBRegressor(
+                n_estimators=config.xgb_n_estimators,
+                max_depth=config.xgb_max_depth,
+                learning_rate=config.xgb_learning_rate,
+                subsample=config.xgb_subsample,
+                colsample_bytree=config.xgb_colsample_bytree,
+                objective="reg:squarederror",
+                eval_metric="rmse",
+                reg_lambda=1.0,
+                random_state=config.random_state,
+                n_jobs=4,
+                verbosity=0,
+            )
+            model.fit(summary_features, targets)
+        elif config.model_type == "ridge":
+            model = ClassicalRidgeRULModel(random_state=config.random_state)
+            model.fit(summary_features, targets)
+        else:
+            model = NaiveRULModel(default_rul=config.rul_reference)
+            model.fit(targets)
         return cls(model, scaler, list(feature_columns), config)
 
     def calibrate_uncertainty(self, validation_frame: pd.DataFrame) -> Tuple[float, float]:
@@ -334,6 +882,12 @@ class PrognosticsAgent:
             rul_reference=self.config.rul_reference,
             seed=self.config.random_state,
         )
+        calibration_engine_count = int(calibration["unit_id"].nunique())
+        if calibration_engine_count < 19:
+            raise ValueError(
+                "At least 19 calibration engines with valid windows are required "
+                "for a finite 95% conformal quantile"
+            )
         selected_reference_rul = calibration["rul"].to_numpy(dtype=float).tolist()
         actual = calibration["rul"].to_numpy(dtype=float)
         predicted = calibration["predicted_rul"].to_numpy(dtype=float)
@@ -341,25 +895,90 @@ class PrognosticsAgent:
         if not np.isfinite(residuals).all():
             raise ValueError("validation terminal residuals must be finite")
 
-        def finite_sample_quantile(level: float) -> float:
-            rank_fraction = min(1.0, ceil((len(residuals) + 1) * level) / len(residuals))
-            return float(np.quantile(residuals, rank_fraction, method="higher"))
+        def finite_sample_quantile(values: np.ndarray, level: float) -> float:
+            # Split conformal uses the ceil((n + 1) * level)-th ordered value.
+            # Selecting that order statistic directly avoids an interpolation
+            # off-by-one caused by mapping rank/n through np.quantile(method="higher").
+            order = ceil((len(values) + 1) * level)
+            if order > len(values):
+                raise ValueError(
+                    f"{len(values)} calibration engines cannot provide a finite "
+                    f"{level:.0%} conformal quantile"
+                )
+            return float(np.partition(values, order - 1)[order - 1])
 
-        self.conformal_q90 = finite_sample_quantile(0.90)
-        self.conformal_q95 = finite_sample_quantile(0.95)
-        self.n_calibration_engines_ = int(calibration["unit_id"].nunique())
+        signed_overestimation = predicted - actual
+        self.conformal_q90 = finite_sample_quantile(residuals, 0.90)
+        self.conformal_q95 = finite_sample_quantile(residuals, 0.95)
+        self.lower_bound_margin_95 = max(
+            0.0, finite_sample_quantile(signed_overestimation, 0.95)
+        )
+        requested_cycles = tuple(
+            getattr(self.config, "planning_margin_cycles", ())
+        )
+        if len(set(requested_cycles)) != len(requested_cycles):
+            raise ValueError("planning_margin_cycles must not contain duplicates")
+        if any(cycle < self.config.window_size for cycle in requested_cycles):
+            raise ValueError(
+                "planning_margin_cycles must be at least the prognostics window size"
+            )
+        self.planning_margins_by_cycle_ = {}
+        self.planning_margin_engine_counts_by_cycle_ = {}
+        for cycle in requested_cycles:
+            cycle_rows = preds[preds["end_cycle"] == cycle]
+            engine_count = int(cycle_rows["unit_id"].nunique())
+            if engine_count < 19:
+                raise ValueError(
+                    f"At least 19 calibration engines with a cycle-{cycle} "
+                    "prediction are required for a finite 95% planning margin"
+                )
+            cycle_overestimation = (
+                cycle_rows["predicted_rul"].to_numpy(dtype=float)
+                - cycle_rows["rul"].to_numpy(dtype=float)
+            )
+            if not np.isfinite(cycle_overestimation).all():
+                raise ValueError(
+                    f"cycle-{cycle} calibration residuals must be finite"
+                )
+            self.planning_margins_by_cycle_[int(cycle)] = max(
+                0.0, finite_sample_quantile(cycle_overestimation, 0.95)
+            )
+            self.planning_margin_engine_counts_by_cycle_[int(cycle)] = engine_count
+        self.n_calibration_engines_ = calibration_engine_count
         self.calibration_reference_rul_ = selected_reference_rul
         return self.conformal_q90, self.conformal_q95
 
     def _prepare(self, frame: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]:
         scaled = transform_features(frame, self.feature_columns, self.scaler)
+        # Inference must work with telemetry-only input. A NaN target is added
+        # solely because the shared window builder also returns target metadata;
+        # it is discarded here and never reaches the model features.
+        if "rul" not in scaled.columns:
+            scaled = scaled.assign(rul=np.nan)
         windows, _, metadata = make_windows(
             scaled,
             self.feature_columns,
             window_size=self.config.window_size,
             target_column="rul",
         )
-        return summarize_windows(windows), metadata
+        if self.config.model_type in {
+            "lstm",
+            "pytorch_cnn",
+            "pytorch_transformer",
+        }:
+            if getattr(self.config, "include_cycle_feature", False):
+                windows = _append_cycle_channel(windows, metadata)
+            return windows, metadata
+
+        summary_features = summarize_windows(windows)
+        if getattr(self.config, "include_cycle_feature", False):
+            cycle_feature = (
+                metadata["end_cycle"].to_numpy(dtype=np.float32)[:, None] / 100.0
+            )
+            summary_features = np.concatenate(
+                [summary_features, cycle_feature], axis=1
+            )
+        return summary_features, metadata
 
     def predict_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Predict RUL for every valid window in a telemetry frame."""
@@ -372,6 +991,7 @@ class PrognosticsAgent:
                 upper_rul=np.array([], dtype=float),
                 calibrated_lower_95=np.array([], dtype=float),
                 calibrated_upper_95=np.array([], dtype=float),
+                planning_rul_lower_95=np.array([], dtype=float),
                 predicted_health_index=np.array([], dtype=float),
             )
 
@@ -392,6 +1012,23 @@ class PrognosticsAgent:
         # Calibrated conformal prediction interval
         cal_lower_95 = np.maximum(predicted_rul - self.conformal_q95, 0.0)
         cal_upper_95 = predicted_rul + self.conformal_q95
+        # One-sided calibration uses only overestimation residuals. This is the
+        # conservative RUL input used by the planner, separate from the
+        # symmetric interval reported for uncertainty evaluation.
+        # Older saved agents predate the one-sided margin. Their calibrated
+        # symmetric margin remains a conservative compatible fallback.
+        planning_margin = getattr(
+            self, "lower_bound_margin_95", self.conformal_q95
+        )
+        cycle_margins = getattr(self, "planning_margins_by_cycle_", {})
+        margins = np.asarray(
+            [
+                cycle_margins.get(int(cycle), planning_margin)
+                for cycle in metadata["end_cycle"]
+            ],
+            dtype=float,
+        )
+        planning_lower_95 = np.maximum(predicted_rul - margins, 0.0)
 
         result = metadata.copy()
         result["predicted_rul"] = predicted_rul
@@ -400,6 +1037,7 @@ class PrognosticsAgent:
         result["upper_rul"] = upper_rul
         result["calibrated_lower_95"] = cal_lower_95
         result["calibrated_upper_95"] = cal_upper_95
+        result["planning_rul_lower_95"] = planning_lower_95
         result["predicted_health_index"] = np.clip(
             1.0 - predicted_rul / self.config.rul_reference, 0.0, 1.0
         )

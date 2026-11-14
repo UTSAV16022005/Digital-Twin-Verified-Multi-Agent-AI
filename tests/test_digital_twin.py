@@ -61,6 +61,25 @@ class DigitalTwinIntegrationTests(unittest.TestCase):
         self.assertEqual(plan.selected_action, None)
         self.assertEqual(len(plan.rejected_candidates), 1)
 
+    def test_transition_batch_prediction_matches_single_step_interface(self) -> None:
+        twin = self.make_twin()
+        batch = np.array([[0.2], [0.5], [0.9]], dtype=float)
+        predictions = twin.transition_model.predict_next_batch(batch)
+        single = np.stack(
+            [twin.transition_model.predict_next(row) for row in batch]
+        )
+        np.testing.assert_allclose(predictions, single)
+
+    def test_controlled_shutdown_freezes_state_and_has_zero_failure_risk(self) -> None:
+        twin = self.make_twin()
+        state = self.make_state(twin)
+        outcome = twin.simulate(state, "controlled_shutdown", horizon=4)
+        np.testing.assert_allclose(
+            outcome.predicted_state.feature_values, state.feature_values
+        )
+        self.assertEqual(outcome.predicted_failure_risk, 0.0)
+        self.assertFalse(outcome.predicted_state.operating)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,10 +45,79 @@ def regression_metrics(predictions: pd.DataFrame) -> dict[str, float]:
         "mae": float(mean_absolute_error(actual, predicted)),
         "rmse": float(mean_squared_error(actual, predicted) ** 0.5),
         "r2": float(r2_score(actual, predicted)),
-        "interval_coverage_95": float(
+        "tree_dispersion_interval_coverage": float(
             ((actual >= predictions["lower_rul"]) & (actual <= predictions["upper_rul"])).mean()
         ),
+        "tree_dispersion_mean_interval_width": float(
+            (predictions["upper_rul"] - predictions["lower_rul"]).mean()
+        ),
+        "conformal_interval_coverage_95": float(
+            (
+                (actual >= predictions["calibrated_lower_95"])
+                & (actual <= predictions["calibrated_upper_95"])
+            ).mean()
+        ),
+        "conformal_mean_interval_width": float(
+            (predictions["calibrated_upper_95"] - predictions["calibrated_lower_95"]).mean()
+        ),
+        "one_sided_lower_bound_coverage": float(
+            (actual >= predictions["planning_rul_lower_95"]).mean()
+        ),
     }
+
+
+def terminal_error_analysis(
+    predictions: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """Build an auditable one-row-per-engine error report for held-out test engines."""
+    columns = [
+        "unit_id",
+        "end_cycle",
+        "rul",
+        "predicted_rul",
+        "rul_uncertainty",
+        "lower_rul",
+        "upper_rul",
+        "calibrated_lower_95",
+        "calibrated_upper_95",
+        "planning_rul_lower_95",
+    ]
+    per_engine = predictions[columns].copy()
+    per_engine["signed_error"] = per_engine["predicted_rul"] - per_engine["rul"]
+    per_engine["absolute_error"] = per_engine["signed_error"].abs()
+    per_engine["tree_dispersion_covers_rul"] = (
+        (per_engine["rul"] >= per_engine["lower_rul"])
+        & (per_engine["rul"] <= per_engine["upper_rul"])
+    )
+    per_engine["conformal_interval_covers_rul"] = (
+        (per_engine["rul"] >= per_engine["calibrated_lower_95"])
+        & (per_engine["rul"] <= per_engine["calibrated_upper_95"])
+    )
+    per_engine["planning_lower_bound_covers_rul"] = (
+        per_engine["rul"] >= per_engine["planning_rul_lower_95"]
+    )
+    per_engine = per_engine.sort_values("unit_id").reset_index(drop=True)
+
+    worst = per_engine.loc[per_engine["absolute_error"].idxmax()]
+    summary: dict[str, float | int] = {
+        "engine_count": int(len(per_engine)),
+        "median_absolute_error": float(per_engine["absolute_error"].median()),
+        "p90_absolute_error": float(per_engine["absolute_error"].quantile(0.90)),
+        "maximum_absolute_error": float(worst["absolute_error"]),
+        "worst_error_unit_id": int(worst["unit_id"]),
+        "overprediction_count": int((per_engine["signed_error"] > 0).sum()),
+        "underprediction_count": int((per_engine["signed_error"] < 0).sum()),
+        "tree_dispersion_interval_coverage": float(
+            per_engine["tree_dispersion_covers_rul"].mean()
+        ),
+        "conformal_interval_coverage_95": float(
+            per_engine["conformal_interval_covers_rul"].mean()
+        ),
+        "one_sided_lower_bound_coverage": float(
+            per_engine["planning_lower_bound_covers_rul"].mean()
+        ),
+    }
+    return per_engine, summary
 
 
 def transition_mae(model: DataDrivenTransitionModel, frame: pd.DataFrame) -> float:
@@ -82,10 +151,31 @@ def main() -> None:
 
     config = PrognosticsConfig(n_estimators=80)
     prognostics = PrognosticsAgent.fit(train_frame, features, config)
+    q90, q95 = prognostics.calibrate_uncertainty(validation_frame)
     validation_predictions = prognostics.predict_frame(validation_frame)
     test_predictions = prognostics.predict_frame(full_test)
     validation_terminal = prognostics.predict_current(validation_frame)
     test_terminal = prognostics.predict_current(full_test)
+    test_terminal_by_engine, terminal_error_summary = terminal_error_analysis(
+        test_terminal
+    )
+    all_test_engine_ids = set(full_test["unit_id"].unique())
+    scored_test_engine_ids = set(test_terminal["unit_id"].unique())
+    unscored_test_engine_ids = [
+        int(unit_id)
+        for unit_id in sorted(all_test_engine_ids - scored_test_engine_ids)
+    ]
+    test_engine_cycle_counts = full_test.groupby("unit_id", sort=True).size()
+    unscored_test_engines = pd.DataFrame(
+        {
+            "unit_id": unscored_test_engine_ids,
+            "observed_cycles": [
+                int(test_engine_cycle_counts[unit_id])
+                for unit_id in unscored_test_engine_ids
+            ],
+        }
+    )
+    unscored_test_engines["minimum_required_cycles"] = config.window_size
 
     transition_model = DataDrivenTransitionModel(features, alpha=1.0).fit(train_scaled)
     transition_validation_mae = transition_mae(transition_model, validation_scaled)
@@ -152,10 +242,27 @@ def main() -> None:
         "features_dropped_as_constant": dropped,
         "prognostics": {
             "config": config.as_dict(),
+            "uncertainty_calibration": {
+                "method": "finite-sample conformal calibration on one RUL-stratified window per held-out development engine",
+                "calibration_engines": prognostics.n_calibration_engines_,
+                "q90_cycles": q90,
+                "q95_cycles": q95,
+                "one_sided_lower_bound_margin_95_cycles": (
+                    prognostics.lower_bound_margin_95
+                ),
+            },
             "validation_window_metrics": regression_metrics(validation_predictions),
             "validation_terminal_metrics": regression_metrics(validation_terminal),
             "test_window_metrics": regression_metrics(test_predictions),
             "test_terminal_metrics": regression_metrics(test_terminal),
+            "test_terminal_error_analysis": terminal_error_summary,
+            "test_terminal_engine_coverage": {
+                "total_engines": len(all_test_engine_ids),
+                "scored_engines": len(scored_test_engine_ids),
+                "unscored_engines": len(unscored_test_engine_ids),
+                "minimum_required_cycles": config.window_size,
+                "unscored_engine_ids": unscored_test_engine_ids,
+            },
         },
         "digital_twin": {
             "validation_one_step_mae_standardized_units": transition_validation_mae,
@@ -179,6 +286,12 @@ def main() -> None:
     test_predictions.to_csv(
         output_dir / "fd004_prognostics_test_predictions.csv", index=False
     )
+    test_terminal_by_engine.to_csv(
+        output_dir / "fd004_terminal_engine_errors.csv", index=False
+    )
+    unscored_test_engines.to_csv(
+        output_dir / "fd004_unscored_test_engines.csv", index=False
+    )
 
     print("FD004 agent pipeline evaluation")
     print("================================")
@@ -189,14 +302,39 @@ def main() -> None:
         f"RMSE={report['prognostics']['test_terminal_metrics']['rmse']:.3f}, "
         f"R2={report['prognostics']['test_terminal_metrics']['r2']:.3f}"
     )
+    print(
+        "per-engine terminal errors: "
+        f"median={terminal_error_summary['median_absolute_error']:.3f}, "
+        f"p90={terminal_error_summary['p90_absolute_error']:.3f}, "
+        f"worst engine={terminal_error_summary['worst_error_unit_id']} "
+        f"(abs error={terminal_error_summary['maximum_absolute_error']:.3f})"
+    )
+    print(
+        "conformal interval: "
+        f"q95={q95:.2f} cycles; held-out terminal coverage="
+        f"{report['prognostics']['test_terminal_metrics']['conformal_interval_coverage_95']:.1%}"
+    )
+    print(
+        "one-sided planning bound: "
+        f"margin={prognostics.lower_bound_margin_95:.2f} cycles; held-out terminal "
+        f"coverage={report['prognostics']['test_terminal_metrics']['one_sided_lower_bound_coverage']:.1%}"
+    )
+    print(
+        "terminal engine coverage: "
+        f"{len(scored_test_engine_ids)}/{len(all_test_engine_ids)} scored; "
+        f"{len(unscored_test_engine_ids)} lacked a {config.window_size}-cycle window"
+    )
     print(f"Twin validation one-step MAE: {transition_validation_mae:.6f}")
     print(
         f"demo unit={demo_unit}, cycle={demo_cycle}, "
         f"predicted RUL={loop_result.predicted_rul:.2f}, "
+        f"planning lower bound={loop_result.planning_rul_lower_95:.2f}, "
         f"actual RUL evaluation-only={actual_demo_rul:.2f}"
     )
     print(f"selected action: {loop_result.selected_action}")
     print(f"saved report: {output_dir / 'fd004_pipeline_evaluation.json'}")
+    print(f"saved per-engine errors: {output_dir / 'fd004_terminal_engine_errors.csv'}")
+    print(f"saved unscored engines: {output_dir / 'fd004_unscored_test_engines.csv'}")
 
 
 if __name__ == "__main__":

@@ -102,9 +102,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _resolve_project_path(path: Path) -> Path:
+    """Resolve CLI paths relative to the repository when not absolute."""
+
+    expanded = path.expanduser()
+    return (expanded if expanded.is_absolute() else ROOT / expanded).resolve()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = parse_args()
+    args.data_dir = _resolve_project_path(args.data_dir)
+    args.model_dir = _resolve_project_path(args.model_dir)
+    args.report_dir = _resolve_project_path(args.report_dir)
     cfg = MonitoringConfig(
         window_size=args.window_size, stride=args.stride, healthy_cycles=args.healthy_cycles,
         seed=args.seed, learning_rate=args.learning_rate, batch_size=args.batch_size,

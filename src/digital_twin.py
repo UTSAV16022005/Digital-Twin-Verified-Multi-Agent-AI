@@ -146,10 +146,28 @@ class DataDrivenTransitionModel:
         return self
 
     def predict_next(self, feature_values: np.ndarray) -> np.ndarray:
+        """Predict one next state and return a feature vector."""
+
+        return self.predict_next_batch(
+            np.asarray(feature_values, dtype=np.float64).reshape(1, -1)
+        )[0]
+
+    def predict_next_batch(self, feature_values: np.ndarray) -> np.ndarray:
+        """Predict next states for a batch of feature vectors."""
+
         if self.residual_std_ is None:
             raise RuntimeError("Fit the transition model before prediction")
-        values = np.asarray(feature_values, dtype=np.float64).reshape(1, -1)
-        return np.asarray(self.model.predict(values), dtype=np.float64).reshape(1, -1)[0]
+        values = np.asarray(feature_values, dtype=np.float64)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim != 2 or values.shape[1] != len(self.feature_columns):
+            raise ValueError(
+                "feature_values must have shape (samples, len(feature_columns))"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError("feature_values must be finite")
+        predictions = np.asarray(self.model.predict(values), dtype=np.float64)
+        return predictions.reshape(len(values), len(self.feature_columns))
 
     @property
     def residual_std(self) -> np.ndarray:

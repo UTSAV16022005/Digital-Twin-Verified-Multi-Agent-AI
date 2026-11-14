@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import importlib.metadata
 import platform
 import sys
@@ -98,7 +99,7 @@ def package_version(name: str) -> str | None:
         return None
 
 
-def main() -> None:
+def main(model_type: str = "random_forest", include_cycle_feature: bool = False) -> None:
     data_dir = Path("data/raw/cmapss")
     full_train = add_train_rul(load_telemetry(data_dir, "FD001", "train"))
     split = split_engine_units(full_train, validation_fraction=0.2, seed=42)
@@ -110,7 +111,10 @@ def main() -> None:
 
     dropped = constant_columns(train_frame, FEATURE_COLUMNS)
     features = [column for column in FEATURE_COLUMNS if column not in dropped]
-    config = PrognosticsConfig()
+    config = PrognosticsConfig(
+        model_type=model_type,
+        include_cycle_feature=include_cycle_feature,
+    )
     agent = PrognosticsAgent.fit(train_frame, features, config)
 
     # Uncertainty calibration on validation engines (held-out from training)
@@ -127,14 +131,28 @@ def main() -> None:
     test_terminal = agent.predict_current(test_frame)
 
     # Comparative benchmark across models
-    benchmark_results = benchmark_all_prognostics(
-        train_frame, validation_frame, test_frame, features, window_size=config.window_size, seed=config.random_state
-    )
+    if model_type == "random_forest" and not include_cycle_feature:
+        benchmark_results = benchmark_all_prognostics(
+            train_frame,
+            validation_frame,
+            test_frame,
+            features,
+            window_size=config.window_size,
+            seed=config.random_state,
+        )
+    else:
+        benchmark_results = {
+            "status": "skipped",
+            "reason": (
+                "Use grouped training-only model comparison before evaluating "
+                "a non-baseline agent on the official test set."
+            ),
+        }
 
     report = {
         "subset": "FD001",
         "agent": "PrognosticsAgent",
-        "backend": "RandomForestRegressor baseline",
+        "backend": model_type,
         "config": config.as_dict(),
         "train_engines": len(split.train_units),
         "validation_engines": len(split.validation_units),
@@ -187,22 +205,43 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
-    agent.save(models_dir / "fd001_prognostics_agent.joblib")
-    (output_dir / "fd001_prognostics_agent.json").write_text(
+    is_legacy_baseline = model_type == "random_forest" and not include_cycle_feature
+    model_suffix = (
+        "baseline"
+        if is_legacy_baseline
+        else model_type + ("_cycle" if include_cycle_feature else "")
+    )
+    if is_legacy_baseline:
+        model_path = models_dir / "fd001_prognostics_agent.joblib"
+        report_path = output_dir / "fd001_prognostics_agent.json"
+        validation_path = output_dir / "fd001_prognostics_validation_predictions.csv"
+        test_path = output_dir / "fd001_prognostics_test_predictions.csv"
+        per_engine_path = output_dir / "fd001_prognostics_per_engine_test.csv"
+    else:
+        model_path = models_dir / f"fd001_prognostics_agent_{model_suffix}.joblib"
+        report_path = output_dir / f"fd001_prognostics_agent_{model_suffix}.json"
+        validation_path = output_dir / f"fd001_prognostics_validation_{model_suffix}.csv"
+        test_path = output_dir / f"fd001_prognostics_test_{model_suffix}.csv"
+        per_engine_path = output_dir / f"fd001_prognostics_per_engine_test_{model_suffix}.csv"
+    agent.save(model_path)
+    report_path.write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
     validation_predictions.to_csv(
-        output_dir / "fd001_prognostics_validation_predictions.csv", index=False
+        validation_path, index=False
     )
     test_predictions.to_csv(
-        output_dir / "fd001_prognostics_test_predictions.csv", index=False
+        test_path, index=False
     )
     per_engine = pd.DataFrame(report["per_engine_errors_test"])
-    per_engine.to_csv(output_dir / "fd001_prognostics_per_engine_test.csv", index=False)
+    per_engine.to_csv(
+        per_engine_path,
+        index=False,
+    )
 
     print("FD001 Prognostics Agent & Benchmark")
     print("===================================")
-    print("backend: RandomForestRegressor baseline")
+    print(f"backend: {model_type}; cycle feature={include_cycle_feature}")
     print(f"validation conformal 95% margin: +/- {q95:.2f} cycles")
     print(
         "validation windows: "
@@ -228,9 +267,25 @@ def main() -> None:
     print("comparative benchmark terminal test MAE:")
     for model_name, m in benchmark_results.get("test_terminal_metrics", {}).items():
         print(f"  {model_name}: MAE={m['mae']:.3f}, RMSE={m['rmse']:.3f}, NASA={m['nasa_score']:.1f}")
-    print(f"saved model: {models_dir / 'fd001_prognostics_agent.joblib'}")
-    print(f"saved report: {output_dir / 'fd001_prognostics_agent.json'}")
+    print(f"saved model: {model_path}")
+    print(f"saved report: {report_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model-type",
+        choices=(
+            "random_forest",
+            "xgboost",
+            "ridge",
+            "naive",
+            "lstm",
+            "pytorch_cnn",
+            "pytorch_transformer",
+        ),
+        default="random_forest",
+    )
+    parser.add_argument("--cycle-feature", action="store_true")
+    args = parser.parse_args()
+    main(args.model_type, args.cycle_feature)
