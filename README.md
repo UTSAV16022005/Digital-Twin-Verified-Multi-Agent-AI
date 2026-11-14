@@ -430,6 +430,26 @@ trace; the LSTM path uses the model saved by `train_lstm_monitoring`. The PCA
 and LSTM demos save separate JSON traces:
 `fd001_closed_loop_demo.json` and `fd001_closed_loop_demo_lstm.json`.
 
+The integrated demo can run the same role sequence on any included C-MAPSS
+subset (`FD001` through `FD004`) using the `--subset` option. For example, PCA
+monitoring on FD002 is:
+
+```powershell
+python -m scripts.demo_closed_loop --subset FD002
+```
+
+To use the LSTM monitor on FD002, train and save a separate subset-specific
+monitor first, then run the integrated demo:
+
+```powershell
+python -m scripts.train_lstm_monitoring --subset FD002 --model-dir models/fd002_lstm_monitoring_verified --report-dir reports/generated/fd002_lstm_monitoring_verified
+python -m scripts.demo_closed_loop --subset FD002 --monitor-backend lstm
+```
+
+The diagnosis, prognostics, Twin, planner, and safety components are fitted or
+configured from that subset for the demo. Output metrics and the selected
+action can differ from FD001; use each subset's trace as a separate result.
+
 The coordinator accepts telemetry only and rejects an input frame containing
 the `rul` target. Diagnosis outputs are explicitly marked as RUL-derived health
 bands. This is a deterministic, role-based agent system with auditable handoffs;

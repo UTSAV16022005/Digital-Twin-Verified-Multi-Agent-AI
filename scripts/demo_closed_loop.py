@@ -84,9 +84,12 @@ def show_telemetry_preview(
     )
 
 
-def main(monitor_backend: str = "pca") -> None:
-    data_dir = Path("data/raw/cmapss")
-    full_train = add_train_rul(load_telemetry(data_dir, "FD001", "train"))
+def main(monitor_backend: str = "pca", subset: str = "FD001") -> None:
+    subset = subset.upper()
+    if subset not in {"FD001", "FD002", "FD003", "FD004"}:
+        raise ValueError("subset must be FD001, FD002, FD003, or FD004")
+    data_dir = ROOT / "data" / "raw" / "cmapss"
+    full_train = add_train_rul(load_telemetry(data_dir, subset, "train"))
     split = split_engine_units(full_train, validation_fraction=0.2, seed=42)
     train_frame = full_train[full_train["unit_id"].isin(split.train_units)].copy()
     validation_frame = full_train[
@@ -101,16 +104,19 @@ def main(monitor_backend: str = "pca") -> None:
     if monitor_backend == "pca":
         monitor = PCAMonitoringAgent.fit(train_frame, features, healthy_cycles=30)
     elif monitor_backend == "lstm":
+        subset_name = subset.lower()
         monitor_path = (
             ROOT
             / "models"
-            / "fd001_lstm_monitoring_verified"
-            / "fd001_lstm_monitoring.pt"
+            / f"{subset_name}_lstm_monitoring_verified"
+            / f"{subset_name}_lstm_monitoring.pt"
         )
         if not monitor_path.exists():
             raise FileNotFoundError(
-                "Train the LSTM monitoring agent first with "
-                "python -m scripts.train_lstm_monitoring"
+                f"Train the {subset} LSTM monitor first with:\n"
+                f"python -m scripts.train_lstm_monitoring --subset {subset} "
+                f"--model-dir models/{subset_name}_lstm_monitoring_verified "
+                f"--report-dir reports/generated/{subset_name}_lstm_monitoring_verified"
             )
         monitor = LSTMMonitoringAgent.load(monitor_path)
     else:
@@ -180,17 +186,14 @@ def main(monitor_backend: str = "pca") -> None:
 
     output_dir = Path("reports/generated")
     output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / (
-        "fd001_closed_loop_demo_lstm.json"
-        if monitor_backend == "lstm"
-        else "fd001_closed_loop_demo.json"
-    )
+    backend_suffix = "_lstm" if monitor_backend == "lstm" else ""
+    report_path = output_dir / f"{subset.lower()}_closed_loop_demo{backend_suffix}.json"
     report_path.write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
 
-    print("FD001 closed-loop prototype")
-    print("===========================")
+    print(f"{subset} closed-loop prototype")
+    print("=" * (len(subset) + len(" closed-loop prototype")))
     print(
         f"{monitor_backend.upper()} Monitoring -> Diagnosis -> Prognostics -> "
         "Twin -> Planning -> Safety"
@@ -222,5 +225,12 @@ def main(monitor_backend: str = "pca") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--monitor-backend", choices=("pca", "lstm"), default="pca")
-    main(parser.parse_args().monitor_backend)
+    parser.add_argument(
+        "--subset",
+        choices=("FD001", "FD002", "FD003", "FD004"),
+        default="FD001",
+        help="C-MAPSS subset to use for the complete integrated demonstration.",
+    )
+    args = parser.parse_args()
+    main(monitor_backend=args.monitor_backend, subset=args.subset)
 

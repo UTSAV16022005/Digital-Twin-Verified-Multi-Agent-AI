@@ -280,7 +280,7 @@ Run modules from the project root as `python -m scripts.NAME`. The scripts use r
 | `demo_digital_twin.py` | Fits and demonstrates current state estimation and candidate Twin outcomes. |
 | `demo_recovery_planner.py` | Shows action scores, selected action, and rejected candidates. |
 | `demo_agent_pipeline.py` | Demonstrates Prognostics → Twin → Planner without exposing actual RUL to decisions. |
-| `demo_closed_loop.py` | Runs the connected monitoring/diagnosis/prognostics/Twin/planner/safety pipeline; optional `--monitor-backend lstm`. |
+| `demo_closed_loop.py` | Runs the connected monitoring/diagnosis/prognostics/Twin/planner/safety pipeline; accepts `--subset FD001|FD002|FD003|FD004` and optional `--monitor-backend lstm`. |
 | `show_project_summary.py` | Prints a concise summary from saved JSON reports; it does not retrain or rerun experiments. |
 
 **Core evaluations**
@@ -394,7 +394,7 @@ cd "C:\Users\deven\OneDrive\Desktop\new-project"
 python -m scripts.demo_closed_loop --monitor-backend lstm
 ```
 
-This runs one connected example. It uses the already-trained LSTM monitor saved under `models/`, and fits the other pieces needed for that demo. It prints the anomaly score, health state, RUL estimate, safety decisions, and action recommendation.
+This runs one connected example. It uses the already-trained LSTM monitor saved under `models/`, and fits the other pieces needed for that demo. It prints the anomaly score, health state, RUL estimate, safety decisions, and action recommendation. The demo accepts `--subset FD001`, `FD002`, `FD003`, or `FD004`; the default is FD001. If using LSTM on another subset, first train that subset's monitor into the matching subset-specific model folder.
 
 Immediately before calling the coordinator, the current demo also prints the first five and last five rows of the example engine's raw telemetry and normalized feature preview. To keep the terminal readable, it splits the complete selected feature set into narrow column groups. The `rul` label is excluded from telemetry sent into the agents.
 
@@ -416,6 +416,23 @@ python -m scripts.train_prognostics_agent
 ```
 
 The broader evaluation commands are listed in the README. They can take longer than the live demonstration and need not be rerun during a presentation if the saved reports are available.
+
+### Run the whole pipeline on another included subset
+
+For example, the full FD002 pipeline with PCA monitoring is:
+
+```powershell
+python -m scripts.demo_closed_loop --subset FD002
+```
+
+For the same pipeline with an FD002 LSTM monitor, train its separate weights first and then select the subset and backend:
+
+```powershell
+python -m scripts.train_lstm_monitoring --subset FD002 --model-dir models/fd002_lstm_monitoring_verified --report-dir reports/generated/fd002_lstm_monitoring_verified
+python -m scripts.demo_closed_loop --subset FD002 --monitor-backend lstm
+```
+
+The output format and agent sequence stay the same, but metrics and recommendations can differ by subset. The JSON trace is saved as `reports/generated/fd002_closed_loop_demo.json` for PCA or `fd002_closed_loop_demo_lstm.json` for LSTM.
 
 ## 10. Questions a reviewer may ask
 
