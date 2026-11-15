@@ -524,3 +524,72 @@ CNN, and Transformer prognostics. Those comparisons use fixed configurations;
 broader hyperparameter search, physical fault labels, measured action effects,
 and independent external validation remain future research work.
 
+## Separate dataset evaluation
+
+### Dataset-aware terminal agent demo
+
+Run the short handoff demo with the evaluated dataset artifacts:
+
+```powershell
+python -m scripts.demo_multidataset_agents --dataset cmapss
+python -m scripts.demo_multidataset_agents --dataset nasa_turbofan_ds2
+python -m scripts.demo_multidataset_agents --dataset phm2024
+python -m scripts.demo_multidataset_agents --dataset nasa_turbofan_ds2 --role recovery_planner
+```
+
+By default, inputs are read from `data/raw`, evaluated models from
+`models/generated/evaluation_quality_20261115/`, NASA evaluation reports from
+`reports/generated/evaluation_quality_20261115/`, and the NASA audit sidecar
+from `data/processed/nasa_turbofan_ds2/audit.json`. Use `--data-root`,
+`--evaluation-model-root`, `--evaluation-report-root`, and `--nasa-audit-path`
+to read existing files at another location without copying them. For example:
+
+```powershell
+$Reference = "C:\path\to\reference-root"
+python -m scripts.demo_multidataset_agents --dataset cmapss --evaluation-model-root "$Reference\models\generated\evaluation_quality_20261115" --evaluation-report-root "$Reference\reports\generated\evaluation_quality_20261115"
+python -m scripts.demo_multidataset_agents --dataset nasa_turbofan_ds2 --data-root "$Reference\data\raw" --evaluation-report-root "$Reference\reports\generated\evaluation_quality_20261115" --nasa-audit-path "$Reference\data\processed\nasa_turbofan_ds2\audit.json"
+python -m scripts.demo_multidataset_agents --dataset phm2024 --evaluation-model-root "$Reference\models\generated\evaluation_quality_20261115"
+```
+
+The C-MAPSS demo needs the selected subset's evaluated RUL model and split
+report. PHM needs its evaluated faulty-classifier and torque-margin-regressor
+models. NASA needs its selected cycle-summary ablation report and a matching
+audit sidecar; if the demo's rich-summary model cache is absent, it fits that
+model from the six official development units only. The NASA data root must
+contain the audited `nasa_turbofan_ds2` directory. C-MAPSS Twin transition
+caches and NASA demo model caches are written under the ignored
+`models/generated/multidataset_agent_demo/` directory. JSON traces are written
+under the ignored `reports/generated/multidataset_agent_demo/traces/`
+directory. Base evaluated models and reports are read-only inputs.
+
+The example is stable by default (C-MAPSS FD001 validation unit at cycle 30,
+NASA official development unit 2 at cycle 30, or the lowest PHM labeled
+training sample ID). Select another example with `--subset FD004 --unit-id 5
+--cycle 40` for C-MAPSS, `--unit-id 10 --cycle 40` for NASA, or `--sample-id
+12345` for PHM. A role can be requested explicitly; for example,
+`python -m scripts.demo_multidataset_agents --dataset phm2024 --role
+recovery_planner` returns `not_supported` with the reason.
+
+| Dataset | Demo roles | Metadata and targets | Advisory route |
+|---|---|---|---|
+| C-MAPSS FD001–FD004 | Evaluated RUL model → existing Digital Twin prototype → Recovery Planner (unless a narrower `--role` is requested) | Validation unit/cycle metadata; RUL is removed before prediction and shown only afterward | Existing configured planner heuristic; action effects are assumptions and human review is required |
+| NASA Turbofan Simulation-2 | Selected rich-summary RUL PrognosticsAgent only | Official development unit and cycle; target is removed before prediction | Twin/Recovery Planner return `not_supported`; no NASA action policy is validated |
+| PHM 2024 | Evaluated faulty classifier and torque-margin regressor | `id` stays sample metadata; both targets are absent from each model input | No action policy; Twin, Planner, sequence, and RUL roles return `not_supported` |
+
+Each trace shows metadata, role handoffs, predictions, advisory status, and
+then labeled truth for the selected development example. Those single example
+comparisons are demonstrations, not new evaluation scores. Prediction
+uncertainty from forest tree spread is explicitly marked uncalibrated. The
+PHM dataset supplies no asset IDs, so its row-based demo cannot show
+unseen-engine generalization. Traces are written to the ignored
+`reports/generated/multidataset_agent_demo/traces/` folder.
+
+The ablation saved its selected NASA rich-summary evaluation report but not the
+fitted model object. The first demo run therefore reproduces the same final fit
+on the six official development units and caches that model under the ignored
+`models/generated/multidataset_agent_demo/` folder; it does not open NASA test
+units. The C-MAPSS Twin transition artifact is similarly created only if
+missing, using the existing demo's fit-unit-only training step. Neither
+artifact changes the saved evaluation reports or raw data. The Twin/Planner
+remain a research prototype: simulated action effects do not establish
+real-world effectiveness or physical safety.

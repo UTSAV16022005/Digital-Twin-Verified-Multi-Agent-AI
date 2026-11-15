@@ -19,6 +19,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 HEALTH_STATES = ("healthy", "degraded", "critical")
 UNCERTAIN_STATE = "uncertain"
+DEFAULT_WARNING_RUL = 125
 
 
 def health_state_from_rul(

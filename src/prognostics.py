@@ -1052,6 +1052,121 @@ class PrognosticsAgent:
             "unit_id", sort=True
         ).tail(1)
 
+    def predict_current_available_history(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Return a terminal prediction for every unit using only observed rows.
+
+        Classical window-summary models have a fixed summary-vector width even
+        when the input history is shorter than the training window. For such a
+        unit, summarize its available observations directly rather than
+        dropping the unit or fabricating padded telemetry.
+        """
+
+        if self.config.model_type in {
+            "lstm",
+            "pytorch_cnn",
+            "pytorch_transformer",
+        }:
+            raise ValueError(
+                "Available-history terminal inference is supported only for "
+                "classical window-summary models"
+            )
+        if not {"unit_id", "cycle"}.issubset(frame.columns):
+            raise KeyError("Terminal inference requires unit_id and cycle metadata")
+        if frame.empty:
+            return frame.iloc[0:0].copy()
+
+        terminal = self.predict_current(frame)
+        included_units = set(terminal["unit_id"].astype(int)) if not terminal.empty else set()
+        short_rows: list[dict[str, Any]] = []
+        for unit_id, unit in frame.groupby("unit_id", sort=True):
+            if int(unit_id) in included_units:
+                continue
+            unit = unit.sort_values("cycle")
+            if unit.empty:
+                continue
+            scaled = transform_features(unit, self.feature_columns, self.scaler)
+            values = scaled[self.feature_columns].to_numpy(dtype=np.float32)[
+                -self.config.window_size :
+            ]
+            if len(values) >= 2:
+                summary = summarize_windows(values[None, :, :])
+            else:
+                # Match summarize_windows' [last, mean, std, min, max, slope]
+                # layout for a single observed sample.
+                summary = np.concatenate(
+                    [
+                        values[-1],
+                        values.mean(axis=0),
+                        np.zeros(values.shape[1], dtype=np.float32),
+                        values.min(axis=0),
+                        values.max(axis=0),
+                        np.zeros(values.shape[1], dtype=np.float32),
+                    ]
+                )[None, :]
+            if self.config.include_cycle_feature:
+                summary = np.concatenate(
+                    [
+                        summary,
+                        np.asarray(
+                            [[float(unit["cycle"].iloc[-1]) / 100.0]],
+                            dtype=np.float32,
+                        ),
+                    ],
+                    axis=1,
+                )
+
+            if hasattr(self.model, "estimators_"):
+                tree_predictions = np.asarray(
+                    [tree.predict(summary)[0] for tree in self.model.estimators_],
+                    dtype=np.float64,
+                )
+                predicted_rul = max(0.0, float(tree_predictions.mean()))
+                uncertainty = float(tree_predictions.std())
+            else:
+                predicted_rul = max(0.0, float(self.model.predict(summary)[0]))
+                uncertainty = self.conformal_q95 / 1.96
+
+            end_cycle = int(unit["cycle"].iloc[-1])
+            if "rul" in unit:
+                target_rul = float(unit["rul"].iloc[-1])
+            else:
+                target_rul = float("nan")
+            cycle_margin = getattr(self, "planning_margins_by_cycle_", {}).get(
+                end_cycle,
+                getattr(self, "lower_bound_margin_95", self.conformal_q95),
+            )
+            short_rows.append(
+                {
+                    "unit_id": int(unit_id),
+                    "end_cycle": end_cycle,
+                    "rul": target_rul,
+                    "predicted_rul": predicted_rul,
+                    "rul_uncertainty": uncertainty,
+                    "lower_rul": max(0.0, predicted_rul - 1.96 * uncertainty),
+                    "upper_rul": predicted_rul + 1.96 * uncertainty,
+                    "calibrated_lower_95": max(
+                        0.0, predicted_rul - self.conformal_q95
+                    ),
+                    "calibrated_upper_95": predicted_rul + self.conformal_q95,
+                    "planning_rul_lower_95": max(
+                        0.0, predicted_rul - float(cycle_margin)
+                    ),
+                    "predicted_health_index": float(
+                        np.clip(
+                            1.0 - predicted_rul / self.config.rul_reference,
+                            0.0,
+                            1.0,
+                        )
+                    ),
+                }
+            )
+
+        if short_rows:
+            terminal = pd.concat(
+                [terminal, pd.DataFrame(short_rows)], ignore_index=True
+            )
+        return terminal.sort_values(["unit_id", "end_cycle"]).reset_index(drop=True)
+
     def save(self, path: Path | str) -> None:
         joblib.dump(self, path)
 
