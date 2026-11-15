@@ -507,6 +507,73 @@ engine. In the current run, removing both assumed operating benefits changed
 changing only the degradation assumption changed 44.2% and 55.3%. The JSON and
 state-level CSV are saved under `reports/generated/`.
 
+## External dataset ingestion (SECOM and PHM 2024)
+
+These datasets are added through task-specific adapters and a shared
+`DatasetBundle` interface. Their raw feature meanings and task labels are
+preserved; they are not renamed into C-MAPSS sensors, converted into RUL, or
+passed to the C-MAPSS Digital Twin and recovery planner. This lets the project
+compare suitable models per dataset without claiming the datasets describe the
+same system.
+
+- **UCI SECOM** is a semiconductor manufacturing pass/fail classification
+  dataset with 1,567 rows and 590 numeric columns in `secom.data`. The UCI
+  catalog describes 591 total fields in its combined dataset summary; the
+  downloaded measurement file itself parses to 590 columns, with labels and
+  timestamps supplied separately. The source labels `-1` (pass)
+  and `1` (fail) are mapped to `faulty=0` and `faulty=1`. Timestamps and source
+  labels stay in metadata. Missing measurements are preserved for preprocessing
+  fitted on training data only. The dataset is highly imbalanced, so failure
+  recall, F1, PR-AUC, and balanced accuracy matter more than accuracy alone.
+- **PHM Society 2024 challenge** contains helicopter-turbine observations and
+  supports two separate tasks: faulty/not-faulty classification and torque
+  margin regression. Training has seven physical measurements and both labels.
+  Test and validation provide measurements only in the downloaded files, so
+  their targets are not invented. The supplied `id` is retained as sample
+  metadata and excluded from model features. The challenge documentation says
+  training observations were shuffled and asset IDs removed, so this project
+  cannot claim asset-disjoint local validation from the supplied row IDs.
+- **C-MAPSS** remains the project's turbofan sequence and RUL benchmark. Its
+  sequence models, Digital Twin, and recovery-planning evaluation are specific
+  to that task and are not automatically applied to SECOM or PHM 2024.
+
+Download and extract source data under `data/raw/` using the official sources:
+
+- [UCI SECOM dataset and description](https://archive.ics.uci.edu/dataset/179/secom)
+- [PHM Society 2024 Data Challenge](https://data.phmsociety.org/phm2024-conference-data-challenge/)
+
+Expected local layout:
+
+```text
+data/raw/secom/secom.data
+data/raw/secom/secom_labels.data
+data/raw/phm2024/extracted/training/X_train.csv
+data/raw/phm2024/extracted/training/y_train.csv
+data/raw/phm2024/extracted/test/X_test.csv
+data/raw/phm2024/extracted/validation/X_validation.csv
+```
+
+Run a data-only audit before any model work:
+
+```powershell
+python -m scripts.audit_external_datasets
+```
+
+The audit checks schema, row counts, missing/infinite values, duplicate
+features, label counts, feature-target ID alignment, and first/last five-row
+previews. For PHM 2024 it also checks archive integrity and confirms the
+extracted CSV files have the same SHA-256 hashes as the CSV members in the
+archives. It does not fit models or modify the raw data. Raw archives and
+extracted files remain ignored by Git; only adapters, audit code, and
+documentation are committed.
+
+The initial audit found 41,951 missing cells in SECOM and 116 constant SECOM
+measurements. PHM 2024 has 742,625 labeled training rows, 21,436 test rows, and
+21,436 validation rows; its downloaded test and validation files have no
+targets. The PHM training split contains repeated feature rows, which are
+reported but retained pending a documented train-only duplicate ablation.
+These counts describe dataset integrity, not predictive performance.
+
 ## Implementation status and limits
 
 Implemented end-to-end for this benchmark: preprocessing; anomaly monitoring;
